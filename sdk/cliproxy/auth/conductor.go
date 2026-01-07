@@ -119,6 +119,9 @@ type Manager struct {
 
 	// Auto refresh state
 	refreshCancel context.CancelFunc
+
+	// concurrencyLimiter manages per-auth concurrent request slots.
+	concurrencyLimiter *ConcurrencyLimiter
 }
 
 // NewManager constructs a manager with optional custom selector and hook.
@@ -136,6 +139,7 @@ func NewManager(store Store, selector Selector, hook Hook) *Manager {
 		hook:            hook,
 		auths:           make(map[string]*Auth),
 		providerOffsets: make(map[string]int),
+		concurrencyLimiter: NewConcurrencyLimiter(),
 	}
 }
 
@@ -388,6 +392,13 @@ func (m *Manager) executeWithProvider(ctx context.Context, provider string, req 
 			return cliproxyexecutor.Response{}, errPick
 		}
 
+		// Acquire concurrency slot; if full, mark as tried and retry
+		release := m.concurrencyLimiter.Acquire(auth)
+		if release == nil {
+			tried[auth.ID] = struct{}{}
+			continue
+		}
+
 		accountType, accountInfo := auth.AccountInfo()
 		proxyInfo := auth.ProxyInfo()
 		entry := logEntryWithRequestID(ctx)
@@ -417,6 +428,7 @@ func (m *Manager) executeWithProvider(ctx context.Context, provider string, req 
 		resp, errExec := executor.Execute(execCtx, auth, execReq, opts)
 		result := Result{AuthID: auth.ID, Provider: provider, Model: routeModel, Success: errExec == nil}
 		if errExec != nil {
+			release()
 			result.Error = &Error{Message: errExec.Error()}
 			var se cliproxyexecutor.StatusError
 			if errors.As(errExec, &se) && se != nil {
@@ -429,6 +441,7 @@ func (m *Manager) executeWithProvider(ctx context.Context, provider string, req 
 			lastErr = errExec
 			continue
 		}
+		release()
 		m.MarkResult(execCtx, result)
 		return resp, nil
 	}
@@ -512,6 +525,13 @@ func (m *Manager) executeStreamWithProvider(ctx context.Context, provider string
 			return nil, errPick
 		}
 
+		// Acquire concurrency slot; if full, mark as tried and retry
+		release := m.concurrencyLimiter.Acquire(auth)
+		if release == nil {
+			tried[auth.ID] = struct{}{}
+			continue
+		}
+
 		accountType, accountInfo := auth.AccountInfo()
 		proxyInfo := auth.ProxyInfo()
 		entry := logEntryWithRequestID(ctx)
@@ -540,6 +560,7 @@ func (m *Manager) executeStreamWithProvider(ctx context.Context, provider string
 		execReq.Model, execReq.Metadata = m.applyOAuthModelMapping(auth, execReq.Model, execReq.Metadata)
 		chunks, errStream := executor.ExecuteStream(execCtx, auth, execReq, opts)
 		if errStream != nil {
+			release()
 			rerr := &Error{Message: errStream.Error()}
 			var se cliproxyexecutor.StatusError
 			if errors.As(errStream, &se) && se != nil {
@@ -552,7 +573,8 @@ func (m *Manager) executeStreamWithProvider(ctx context.Context, provider string
 			continue
 		}
 		out := make(chan cliproxyexecutor.StreamChunk)
-		go func(streamCtx context.Context, streamAuth *Auth, streamProvider string, streamChunks <-chan cliproxyexecutor.StreamChunk) {
+		go func(streamCtx context.Context, streamAuth *Auth, streamProvider string, streamChunks <-chan cliproxyexecutor.StreamChunk, streamRelease func()) {
+			defer streamRelease()
 			defer close(out)
 			var failed bool
 			for chunk := range streamChunks {
@@ -570,7 +592,7 @@ func (m *Manager) executeStreamWithProvider(ctx context.Context, provider string
 			if !failed {
 				m.MarkResult(streamCtx, Result{AuthID: streamAuth.ID, Provider: streamProvider, Model: routeModel, Success: true})
 			}
-		}(execCtx, auth.Clone(), provider, chunks)
+		}(execCtx, auth.Clone(), provider, chunks, release)
 		return out, nil
 	}
 }
@@ -1197,6 +1219,10 @@ func (m *Manager) pickNext(ctx context.Context, provider, model string, opts cli
 			continue
 		}
 		if modelKey != "" && registryRef != nil && !registryRef.ClientSupportsModel(candidate.ID, modelKey) {
+			continue
+		}
+		// Skip auth if concurrency limit is reached
+		if m.concurrencyLimiter.IsFull(candidate) {
 			continue
 		}
 		candidates = append(candidates, candidate)

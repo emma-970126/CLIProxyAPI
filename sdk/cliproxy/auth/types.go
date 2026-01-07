@@ -59,6 +59,10 @@ type Auth struct {
 	// ModelStates tracks per-model runtime availability data.
 	ModelStates map[string]*ModelState `json:"model_states,omitempty"`
 
+	// MaxConcurrency limits concurrent requests for this auth.
+	// 0 means use provider default (e.g. iFlow defaults to 1).
+	MaxConcurrency int `json:"max_concurrency,omitempty"`
+
 	// Runtime carries non-serialisable data used during execution (in-memory only).
 	Runtime any `json:"-"`
 
